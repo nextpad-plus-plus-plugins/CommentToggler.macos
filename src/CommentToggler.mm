@@ -33,7 +33,7 @@ static const ui64 NPOS = (ui64)-1;
 #define L_USER_LANG 15   // Windows L_USER enum value
 
 static const char *PLUGIN_NAME = "Comment Toggler";
-static const int nbFunc = 2;
+static const int nbFunc = 3;   // Toggle comment | (sep) | About
 
 // L_*-indexed language names (matches langs.model.xml <Language name="…">).
 static const char *kLangNames[] = {
@@ -57,7 +57,7 @@ struct Selection { ui64 beg, end, idx; };
 
 NppData nppData;
 FuncItem funcItem[nbFunc];
-ShortcutKey gShortcut;  // reserved; left unbound to avoid macOS Cmd-key conflicts
+[[maybe_unused]] ShortcutKey gShortcut;  // reserved; left unbound to avoid macOS Cmd-key conflicts
 
 NppHandle gSci = 0;
 std::map<std::string, Tags> gTagDB;
@@ -280,6 +280,65 @@ i64 doToggleComment(ui64 sel_s, ui64 sel_e, ui64 sel_i) {
     return 0;
 }
 
+// ── UDL comment lookup (Windows-parity: identify the UDL by file extension) ──
+// User Defined Languages live as XML in the app's bundled userDefineLangs/ and
+// the user config dir's userDefineLangs/. Their "Comments" keyword list encodes
+// tokens as "00<line> 01<..> 02<..> 03<blockOpen> 04<blockClose>" (NSXML decodes
+// the XML entities). Returns true if a UDL claiming `ext` was found; line/beg/end
+// are filled from its comment tokens (any may stay empty).
+bool udlCommentTokensForExt(const std::string &ext,
+                            std::string &line, std::string &beg, std::string &end) {
+    if (ext.empty()) return false;
+    @autoreleasepool {
+        NSString *nsExt = [NSString stringWithUTF8String:ext.c_str()];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+        char cfg[2048] = {0};
+        nppData._sendMessage(nppData._nppHandle, NPPM_GETNPPSETTINGSDIRPATH,
+                             (uintptr_t)sizeof(cfg) - 1, (intptr_t)cfg);
+        if (cfg[0])
+            [dirs addObject:[[NSString stringWithUTF8String:cfg]
+                             stringByAppendingPathComponent:@"userDefineLangs"]];
+        NSString *bundled = [[[NSBundle mainBundle] resourcePath]
+                             stringByAppendingPathComponent:@"userDefineLangs"];
+        if (bundled) [dirs addObject:bundled];
+
+        for (NSString *dir in dirs) {
+            for (NSString *file in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+                if (![[file lowercaseString] hasSuffix:@".xml"]) continue;
+                NSXMLDocument *doc = [[NSXMLDocument alloc]
+                    initWithContentsOfURL:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:file]]
+                                  options:0 error:nil];
+                if (!doc) continue;
+                for (NSXMLElement *ul in [doc nodesForXPath:@"//UserLang" error:nil]) {
+                    NSString *exts = [[ul attributeForName:@"ext"] stringValue] ?: @"";
+                    BOOL match = NO;
+                    for (NSString *e in [exts componentsSeparatedByCharactersInSet:
+                                         [NSCharacterSet whitespaceAndNewlineCharacterSet]])
+                        if (e.length && [e caseInsensitiveCompare:nsExt] == NSOrderedSame) { match = YES; break; }
+                    if (!match) continue;
+                    for (NSXMLElement *kw in [ul nodesForXPath:@".//Keywords[@name='Comments']" error:nil]) {
+                        for (NSString *tok in [([kw stringValue] ?: @"")
+                                 componentsSeparatedByCharactersInSet:
+                                 [NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+                            if (tok.length < 2) continue;
+                            NSString *code = [tok substringToIndex:2];
+                            NSString *val  = [tok substringFromIndex:2];
+                            if ([val isEqualToString:@"((EOL))"]) continue;   // EOL marker, not a literal
+                            if      ([code isEqualToString:@"00"]) line = val.UTF8String;   // line comment
+                            else if ([code isEqualToString:@"03"]) beg  = val.UTF8String;   // block open
+                            else if ([code isEqualToString:@"04"]) end  = val.UTF8String;   // block close
+                        }
+                    }
+                    return true;   // matched this UDL (comment tokens may be empty)
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 void toggleComment() {
     @autoreleasepool {
@@ -291,7 +350,19 @@ void toggleComment() {
         nppData._sendMessage(nppData._nppHandle, NPPM_GETCURRENTLANGTYPE, 0, (intptr_t)&lang_t);
 
         if (lang_t == 0) { gLine = ">>> "; gBeg = "["; gEnd = "]"; }     // plain text (as original)
-        else if (lang_t == L_USER_LANG) { gLine.clear(); gBeg.clear(); gEnd.clear(); } // UDL: not yet supported
+        else if (lang_t == L_USER_LANG) {
+            // UDL buffer: identify the specific User Defined Language by the
+            // file's extension and read its comment tokens from the UDL XML.
+            gLine.clear(); gBeg.clear(); gEnd.clear();
+            char fpath[4096] = {0};
+            nppData._sendMessage(nppData._nppHandle, NPPM_GETFULLCURRENTPATH,
+                                 (uintptr_t)sizeof(fpath) - 1, (intptr_t)fpath);
+            std::string fp(fpath);
+            size_t dot = fp.find_last_of('.');
+            size_t slash = fp.find_last_of("/\\");
+            if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+                udlCommentTokensForExt(fp.substr(dot + 1), gLine, gBeg, gEnd);
+        }
         else if (lang_t >= 0 && lang_t < kLangCount) {
             auto it = gTagDB.find(kLangNames[lang_t]);
             if (it != gTagDB.end()) { gLine = it->second.line; gBeg = it->second.beg; gEnd = it->second.end; }
@@ -330,9 +401,26 @@ void toggleComment() {
     }
 }
 
-void visitHomepage() {
+void cmdAbout() {
     @autoreleasepool {
-        [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://github.com/ScienceDiscoverer/CommentToggler"]];
+        NSAlert *a = [[NSAlert alloc] init];
+        a.alertStyle = NSAlertStyleInformational;
+        a.messageText = @"Comment Toggler";
+        a.informativeText =
+            @"Comment Toggler for Notepad++ (macOS port)\n"
+            @"Version 1.0.0\n\n"
+            @"Toggles line and block comments on the current selection(s), "
+            @"auto-detecting the comment syntax for the current language.\n\n"
+            @"Features:\n"
+            @"- Single-line, multi-line (indent-aware) and block comment modes\n"
+            @"- Per-language comment tokens for built-in languages\n"
+            @"- User Defined Languages: comment tokens read from the UDL by extension\n"
+            @"- Toolbar button\n\n"
+            @"Original Windows plugin by ScienceDiscoverer (GPL v3)\n"
+            @"macOS port by Andrey Letov\n"
+            @"Project home: https://github.com/nextpad-plus-plus-plugins/CommentToggler.macos";
+        [a addButtonWithTitle:@"OK"];
+        [a runModal];
     }
 }
 
@@ -345,9 +433,14 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
     strncpy(funcItem[0]._itemName, "Toggle comment", NPP_MENU_ITEM_SIZE - 1);
     funcItem[0]._pFunc = toggleComment;
     funcItem[0]._pShKey = nullptr;
-    strncpy(funcItem[1]._itemName, "Plug-in homepage", NPP_MENU_ITEM_SIZE - 1);
-    funcItem[1]._pFunc = visitHomepage;
+
+    strncpy(funcItem[1]._itemName, "---", NPP_MENU_ITEM_SIZE - 1);   // separator
+    funcItem[1]._pFunc = nullptr;
     funcItem[1]._pShKey = nullptr;
+
+    strncpy(funcItem[2]._itemName, "About...", NPP_MENU_ITEM_SIZE - 1);
+    funcItem[2]._pFunc = cmdAbout;
+    funcItem[2]._pShKey = nullptr;
 }
 
 extern "C" NPP_EXPORT const char *getName() { return PLUGIN_NAME; }
